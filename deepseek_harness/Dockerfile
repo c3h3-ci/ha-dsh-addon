@@ -1,4 +1,4 @@
-ARG BUILD_VERSION="0.2.43"
+ARG BUILD_VERSION="0.2.44"
 ARG BUILD_ARCH="aarch64"
 ARG BUILD_FROM="node:22-bookworm-slim"
 
@@ -52,7 +52,13 @@ RUN npm install -g pnpm \
     && pnpm config set global-bin-dir /usr/local/bin --global \
     && pnpm config set registry https://registry.npmmirror.com --global
 
-RUN npm install -g @deepseek-ai/dsh@latest \
+# 镜像内置 DSH（离线兜底版）。
+# ⚠️ 通道统一（2026-09-27 修订）：此处原为 @latest，而 run.sh 首装与
+# api_server.js 一键更新默认走 next，三处不一致导致"装完即最新"的承诺落空
+# （latest 曾停在 0.1.5-rc.3，而 next 已是 0.1.7-rc.2）。现统一为 @next。
+# 可用构建参数 DSH_CHANNEL 覆盖（build.yaml 可传），保持与 run.sh 一致。
+ARG DSH_CHANNEL=next
+RUN npm install -g "@deepseek-ai/dsh@${DSH_CHANNEL}" \
     && ln -sf /usr/local/lib/node_modules/@deepseek-ai/dsh/lib/bin.js /usr/local/bin/dsh \
     && rm -f /usr/local/lib/node_modules/.package-lock.json 2>/dev/null
 
@@ -62,7 +68,9 @@ RUN rm -rf /data/dsh/vendor /data/dsh/vendor.tmp /data/dsh/vendor.old \
 COPY run.sh /run.sh
 COPY proxy.js /proxy.js
 COPY api_server.js /api_server.js
-RUN chmod a+x /run.sh
+COPY vendor_check.js /vendor_check.js
+COPY healthcheck.sh /healthcheck.sh
+RUN chmod a+x /run.sh /healthcheck.sh
 
 # 拷贝 HA 自定义集成（custom_components）
 # 容器启动时 run.sh 会复制到 /config/custom_components/，实现 addon 自带集成
@@ -80,8 +88,16 @@ COPY custom_components/ /custom_components/
 # 探 3080（HTTP proxy → Web UI）：curl 的连接成功即视为健康。
 # 用 \`|| exit 1\` 而非判断状态码：401/200/302 都说明服务在监听，
 # 只有【连不上】（000）才是真的挂了。
-HEALTHCHECK --interval=30s --timeout=10s --start-period=120s --retries=3 \
-    CMD curl -s -o /dev/null --connect-timeout 5 http://127.0.0.1:3080/ || exit 1
+#
+# ⚠️ 容差为何调大（2026-09-27 二次踩坑）：一键更新会在容器内跑 npm install
+#    （522 个包 / 低功耗 ARM 上约 10 分钟），期间 CPU 被吃满，3080 可能连续
+#    几个探测周期无响应。旧参数（interval 30s × retries 3 ≈ 90s）会在此期间
+#    把容器判为 unhealthy → Supervisor watchdog 重启容器 → **npm install 被杀**
+#    → 留下半截 vendor.tmp，更新永远失败。
+#    现放宽到 interval 30s / timeout 15s / retries 6（≈3 分钟连续失败才重启），
+#    并配合 install 侧 `nice -n 19`（见 api_server.js）保住 UI 响应。
+HEALTHCHECK --interval=30s --timeout=15s --start-period=120s --retries=6 \
+    CMD ["/healthcheck.sh"]
 
 WORKDIR /config
 CMD [ "/run.sh" ]

@@ -96,12 +96,17 @@ DSH 处于测试期（rc.x），更新频繁。本 addon 提供 Web 一键更新
 
 | 通道 | 说明 |
 |------|------|
-| `latest` | npm 稳定 tag（当前 `0.1.2-rc.1`），方案 A 首次自动安装与镜像内置版默认目标 |
-| `next` | npm 预发布 tag（当前 `0.1.2-rc.1`，与 latest 相同），手动一键更新默认目标 |
+| `next` | npm 预发布 tag，**默认通道**（镜像内置、首次自动安装、一键更新三处一致，由 `DSH_CHANNEL` 统一控制） |
+| `latest` | npm 稳定 tag，手动一键更新时可选 |
+
+> **单一事实源**（0.2.44 起）：默认通道只在一处定义（`run.sh` 的 `DSH_CHANNEL` 常量，
+> 默认 `next`；`Dockerfile` 用同名构建参数）。历史上三处各写各的
+> （`run.sh` 用 `latest`、`Dockerfile` 用 `@latest`、一键更新用 `next`），
+> 导致首次安装的版本与"检查更新"提示对不上。
 
 ## DSH 兼容性
 
-addon 兼容层的目标是当前 DSH 版本线（`0.1.2-rc.1`，镜像内置与 vendor 自动安装同源）。针对 rc.1 的关键适配由 addon 自动完成，用户无感知：
+addon 兼容层的目标是当前 DSH 版本线（镜像内置与 vendor 自动安装同源，均为 `next` 通道当前版本）。针对该版本线的关键适配由 addon 自动完成，用户无感知：
 
 - **强制浏览器会话认证**（rc.1+ 对全部 API 401 拦截）：代理自动从持久化凭据生成签名 Cookie 并注入全部转发请求与 WebSocket，桥接层同样按需生成、401 自动重试。
 - **Ingress 查询串规范化**：HA ingress 转发会重编码查询串，破坏 DSH 插件打包器 URL（`/plugins/??列表&rev=x`）的精确匹配；代理自动还原。
@@ -110,6 +115,14 @@ addon 兼容层的目标是当前 DSH 版本线（`0.1.2-rc.1`，镜像内置与
 DSH 上游若再变更加密方案、bundler URL 形态或 RPC 契约，需要发布新版 addon 适配（proxy 对关键改写点带有"上游模式变化"告警日志，可快速定位）。
 
 ## 变更日志
+
+### 0.2.44
+
+- 🐛 **修复 vendor 完整性校验漏查传递依赖**（崩溃循环真正根因）：旧校验只查 DSH 自身顶层依赖（81 个），传参依赖全不看，于是 `execa` 的传递依赖 `is-plain-obj` 缺失时，DSH 启动即 `ERR_MODULE_NOT_FOUND` → 退出 → watchdog 反复拉起 → 崩溃循环，而每次自检仍打印 `integrity OK (deps: 81)`。现递归校验整棵 `node_modules`（含嵌套）下每个包的声明依赖。
+- 🐛 **修复一键更新被 watchdog 中途杀死**：`npm install`（约 10 分钟）期间 CPU 吃满被判 unhealthy → 容器重启 → 安装被杀，只留半截 `vendor.tmp`。现安装期写 `/data/dsh/.installing` 让 healthcheck 豁免（上限 30 分钟）、探针容差放宽到约 3 分钟、装包进程 `nice -n 19`。
+- 🐛 **修复半截安装被当作"安装成功"换上**：切换前必须先通过完整依赖图校验，不通过则放弃切换并**保留旧版本可用**。
+- 🔄 **更新通道统一为单一事实源** `DSH_CHANNEL`（默认 `next`）：此前 `run.sh` 用 `latest`、`Dockerfile` 用 `@latest`、一键更新用 `next`，导致首装版本与"检查更新"提示对不上。
+- 🔄 **vendor 损坏时先尝试 `vendor.old` 回滚**，两者都不可用才回退镜像内置版（原先直接删除，丢掉了唯一可回滚版本）。
 
 ### 0.2.43
 

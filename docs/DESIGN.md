@@ -235,7 +235,7 @@ addon 壳与配套集成 `deepseek_harness` 采用**独立版本轨道**（见 �
 - 已发布的 Release 提交信息错误时，**不要 force-push 重写 tag**，而应递增 minor 版本（如 0.2.13 → 0.2.14），否则破坏 HACS 用户缓存。
 
 ### 8.4 DSH 升级的现状
-- Dockerfile 用 `npm install -g @deepseek-ai/dsh@next` → 装 rc.8（当前 `next` tag）。
+- Dockerfile 用 `npm install -g @deepseek-ai/dsh@${DSH_CHANNEL}`（默认 `next`，见 §9.5）作离线兜底。
 - 用户可通过 Web UI 一键更新按钮随时切换到 `latest` 或 `next` 通道。
 - DSH 在镜像只读层，`npm update -g` 会破坏包 → 需要"Web 一键更新"方案（见 §9）。
 - **设计动机**：DSH 更新快（测试期），若每次上游发 rc 都要维护者重新构建 addon 镜像，成本不可接受。正确姿势是 addon 壳稳定、DSH 本体由用户按需一键更新到上游（见 §9.0 更新边界原则）。
@@ -322,15 +322,60 @@ pnpm 的默认 store 路径取决于 `$HOME` 环境变量，容器重建后 `$HO
 **安全要求**：`/api/update*` 属于高危写操作，必须走与 `/api/chat` 相同的 `Bearer` token 鉴权（fail-closed），防止容器网络内未授权触发任意 npm install / 容器重启。
 
 ### 9.5 版本通道
-- UI 展示 `latest`（rc.7 / 稳定）与 `next`（rc.8 / 预发布）两个通道供选；默认「一键更新」指向 `next` 以达成 rc.8。
+- UI 展示 `latest`（稳定）与 `next`（预发布）两个通道供选；默认「一键更新」指向 `next` 以获取最新 rc。
+- **单一事实源**（2026-09-27 修订）：默认通道由 `DSH_CHANNEL` 常量决定（`run.sh` 默认 `next`），
+  `Dockerfile` 内置安装用同名的 `DSH_CHANNEL` 构建参数，`api_server.js` 的 `POST /api/update`
+  默认值同为 `next`。历史上三处各写各的（`latest` vs `next`），导致首装版本与"检查更新"
+  提示对不上，故此后**只允许改一处**。
 
 ### 9.6 风险与对策
 | 风险 | 对策 |
 |------|------|
-| npm 中断损坏 vendor | 先装 `vendor.tmp` 成功后原子改名 |
-| 新版破坏会话 | 会话在 `/data/dsh/sessions` 不删除；保留旧 vendor 供回滚 |
-| 低性能设备安装慢 | 复用 npmmirror 国内源 |
-| 更新中崩溃 | 容器重启后 run.sh 回退镜像内置版兜底 |
+| npm 中断损坏 vendor | 先装 `vendor.tmp`，**通过依赖图完整性校验后**才原子改名（见 §9.9） |
+| 新版破坏会话 | 会话在 `/data/dsh/sessions` 不删除；`vendor.old` 保留供回滚 |
+| 低性能设备安装慢 | 复用 npmmirror 国内源；`nice -n 19` 降低装包优先级 |
+| 更新中崩溃 | 容器重启后 run.sh 先尝试 `vendor.old` 回滚，再回退镜像内置版兜底 |
+| watchdog 在安装期间误杀容器 | 安装期写 `/data/dsh/.installing` → healthcheck 豁免（上限 30 分钟，见 §9.9） |
+
+### 9.9 vendor 完整性与更新安全（2026-09-27 复盘新增）
+
+本节记录三个曾真实导致事故的缺陷与现状设计，作为后续改动的护栏。
+
+**（1）完整性校验必须覆盖传递依赖**
+
+- **事故**：`execa` 的传递依赖 `is-plain-obj` 缺失 → DSH 启动即 `ERR_MODULE_NOT_FOUND` →
+  进程退出 → Supervisor watchdog 反复拉起 → **崩溃循环**。
+- **为何难查**：旧校验只遍历 `@deepseek-ai/dsh` 自身的顶层 `dependencies`（81 个），
+  传递依赖一个都不查，于是每次启动都打印 `vendor DSH integrity OK (deps: 81)` ——
+  体检绿灯、故障真实存在。
+- **现状**：`vendor_check.js` 递归扫描 `node_modules`（含嵌套）下每个已安装包，
+  逐个校验其声明依赖能否从该包自身位置解析。`peer`/`optional` 不计入。
+  实现由 `run.sh` 与 `api_server.js` 共用，**禁止在两处各写一份**。
+- **注意**：判定"依赖已安装"用**目录存在**（`node_modules/<dep>/package.json`），
+  **不要用 `require.resolve`** —— 后者要求包有可解析入口，会把"存在但无入口文件"
+  的包误判为缺失（实测 `kleur` 被误报过）。
+
+**（2）切换前必须校验，失败必须保住旧版本**
+
+- **事故**：旧实现只检查 `bin.js` 存在就切换；被中断的安装恰好留下
+  「`bin.js` 在、传递依赖缺失」的半截目录 → 换上即崩。
+- **现状**：`runUpdate()` 在原子切换**之前**跑完整性校验；不通过则放弃切换、
+  返回明确错误、清理 `vendor.tmp`，**旧 vendor 原封不动**（用户的可用版本绝不能被升级搞挂）。
+
+**（3）安装期间必须让 watchdog 高抬贵手**
+
+- **事故**：`npm install`（522 包 / 低功耗 ARM 约 10 分钟）期间 CPU 吃满，3080 连续
+  数分钟无响应 → 旧参数（`interval 30s × retries 3` ≈ 90s）判 unhealthy →
+  Supervisor 重启容器 → **npm install 被杀** → 只留半截 `vendor.tmp`，更新永远失败。
+- **现状**：三重保险 —— ① 安装期写 `/data/dsh/.installing`，`healthcheck.sh` 直接豁免
+  （标记设 30 分钟上限，防止失败残留永久关掉自愈）；② 探针容差放宽到
+  `interval 30s / timeout 15s / retries 6`；③ 装包进程 `nice -n 19`。
+
+**（4）更新通道单一事实源**
+
+- **事故**：`run.sh` 首装 `latest`、`Dockerfile` 内置 `@latest`、`api_server.js` 默认
+  `next`，三处不一致 → 首装拿到 0.1.5-rc.3 而 `next` 已是 0.1.7-rc.2，"装完即最新"落空。
+- **现状**：统一由 `DSH_CHANNEL`（默认 `next`，见 §9.5）决定，可用环境变量/构建参数覆盖。
 
 ### 9.7 热重启策略（推荐）
 - **写标记 + 重启整个 addon 容器**（原子、稳），避免进程级热更造成脏状态。

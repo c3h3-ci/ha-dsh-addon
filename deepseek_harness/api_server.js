@@ -41,11 +41,23 @@ const DSH_WEB_PORT = parseInt(process.env.DSH_WEB_PORT || '3081', 10);
 // 共享密钥鉴权：由 run.sh 从 addon 配置 (api_token) 注入。
 // 未配置时对写操作 fail-closed（401），防止容器网络内未授权调用触发 DSH 代码执行。
 const API_TOKEN = process.env.DSH_API_TOKEN || '';
-// 一键更新相关
-const VENDOR_DIR = '/data/dsh/vendor';
-const VENDOR_TMP = '/data/dsh/vendor.tmp';
+// 一键更新相关。路径可用环境变量覆盖，便于契约测试指向临时目录
+// （生产环境不设这些变量，走 /data 下的固定路径）。
+const VENDOR_DIR = process.env.DSH_VENDOR_DIR || '/data/dsh/vendor';
+const VENDOR_TMP = process.env.DSH_VENDOR_TMP || '/data/dsh/vendor.tmp';
 const VENDOR_DSH_BIN = path.join(VENDOR_DIR, 'node_modules/@deepseek-ai/dsh/lib/bin.js');
 const NPM_REGISTRY = process.env.DSH_NPM_REGISTRY || 'https://registry.npmmirror.com';
+
+// 完整性校验与 run.sh 共用同一实现（/vendor_check.js 由 Dockerfile COPY 进来）。
+// 本地开发/测试时回退到仓库内同目录的副本。
+const VENDOR_CHECK_JS = fs.existsSync('/vendor_check.js')
+  ? '/vendor_check.js'
+  : path.join(__dirname, 'vendor_check.js');
+const { checkVendor } = require(VENDOR_CHECK_JS);
+
+// 安装期间的健康豁免标记：一键更新跑 npm install 时写下它，
+// 供 healthcheck.sh 判断"容器不是死了，是在升级"。
+const INSTALL_FLAG = process.env.DSH_INSTALL_FLAG || '/data/dsh/.installing';
 
 // 常量时间比较，避免时序侧信道
 function tokenMatches(header) {
@@ -547,26 +559,52 @@ async function handleUpdate(req, res) {
 let updateInFlight = false;
 let updateResult = null;
 
-// 后台更新：npm install 到 vendor.tmp → 原子改名 → 重启容器
+// 后台更新：npm install 到 vendor.tmp → **完整性校验** → 原子改名 → 重启容器
 async function runUpdate(channel) {
   const marker = path.join(VENDOR_DIR, '.updated');
   updateResult = { status: 'installing', channel, at: new Date().toISOString() };
+  // 写下"升级中"标记：healthcheck/run.sh 据此区分"在装包"与"真挂了"，
+  // 避免 Supervisor watchdog 在 npm install 期间重启容器把安装打断。
+  try {
+    fs.writeFileSync(INSTALL_FLAG, JSON.stringify({
+      channel, pid: process.pid, at: new Date().toISOString(),
+    }));
+  } catch (e) {
+    console.error('[DSH Addon] cannot write install flag:', e.message);
+  }
   try {
     // 1. 清理残留 tmp
     fs.rmSync(VENDOR_TMP, { recursive: true, force: true });
     fs.mkdirSync(VENDOR_TMP, { recursive: true });
 
     // 2. npm install 到 vendor.tmp（npmmirror 国内源）
+    //    nice -n 19：把装包压到最低 CPU 优先级，保证 3080 在 10 分钟安装期间
+    //    仍能响应健康探测（否则探测超时 → watchdog 重启 → 安装被杀）。
+    //
+    //    测试缝：DSH_TEST_INSTALL_SCRIPT 指向一个脚本时改跑它（模拟安装成功/
+    //    半截中断），使"切换前校验"这条关键路径能在 CI 里被真实覆盖 ——
+    //    生产环境不设该变量，永远走 npm。
+    const installCmd = process.env.DSH_TEST_INSTALL_SCRIPT;
     await new Promise((resolve, reject) => {
+      if (installCmd) {
+        execFile(installCmd, [VENDOR_TMP, channel], { timeout: 60 * 1000 },
+          (err, stdout, stderr) => {
+            if (err) reject(new Error('test install failed: ' + (stderr || err.message).slice(0, 300)));
+            else resolve();
+          });
+        return;
+      }
       execFile(
-        'npm',
+        'nice',
         [
+          '-n', '19',
+          'npm',
           'install', `@deepseek-ai/dsh@${channel}`,
           '--prefix', VENDOR_TMP,
           '--registry', NPM_REGISTRY,
           '--no-audit', '--no-fund',
         ],
-        { timeout: 10 * 60 * 1000, maxBuffer: 16 * 1024 * 1024 },
+        { timeout: 20 * 60 * 1000, maxBuffer: 16 * 1024 * 1024 },
         (err, stdout, stderr) => {
           if (err) {
             console.error('[DSH Addon] npm install failed:', stderr.slice(0, 1000));
@@ -578,9 +616,18 @@ async function runUpdate(channel) {
       );
     });
 
-    // 3. 校验 vendor.tmp 里 DSH 存在
+    // 3. 校验 vendor.tmp 里 DSH 存在 + **依赖图完整**
     const tmpBin = path.join(VENDOR_TMP, 'node_modules/@deepseek-ai/dsh/lib/bin.js');
     if (!fs.existsSync(tmpBin)) throw new Error('安装成功但未找到 DSH bin');
+
+    // ⚠️ 切换前必须校验（旧实现只查 bin.js 存在即切换）：
+    // 被 watchdog 打断的 npm install 会留下 bin.js 已落盘、传递依赖缺失的
+    // 半截目录；若直接换上，容器下次启动即 ERR_MODULE_NOT_FOUND → 崩溃循环。
+    const check = checkVendor(VENDOR_TMP);
+    if (!check.ok) {
+      const detail = check.reason || `缺失依赖 ${check.missing.length} 个: ${check.missing.slice(0, 5).join(', ')}`;
+      throw new Error('新版本依赖不完整，已放弃切换（旧版本保持可用）: ' + detail);
+    }
 
     // 4. 原子切换：旧 vendor 备份为 vendor.old，tmp 改名为 vendor
     fs.rmSync(VENDOR_DIR + '.old', { recursive: true, force: true });
@@ -603,6 +650,13 @@ async function runUpdate(channel) {
   } catch (e) {
     updateResult = { status: 'error', channel, error: e.message, at: new Date().toISOString() };
     updateInFlight = false; // 失败则释放锁，允许重试
+    // 清掉失败残留的 vendor.tmp：半截的包树在 HA 上要占几百 MB，
+    // 且下次启动 run.sh 也会先删它；留着只会浪费磁盘、误导排查。
+    try { fs.rmSync(VENDOR_TMP, { recursive: true, force: true }); } catch {}
+  } finally {
+    // 无论成败都清掉"升级中"标记 —— 否则容器会永远以为自己还在升级，
+    // watchdog 的健康豁免长期生效，真崩溃时反而不重启。
+    try { fs.rmSync(INSTALL_FLAG, { force: true }); } catch {}
   }
 }
 
