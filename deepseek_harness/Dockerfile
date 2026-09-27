@@ -30,6 +30,11 @@ RUN sed -i 's|deb.debian.org|mirrors.tuna.tsinghua.edu.cn|g' /etc/apt/sources.li
     sed -i 's|deb.debian.org|mirrors.tuna.tsinghua.edu.cn|g' /etc/apt/sources.list
 
 # 安装运行时依赖
+# ⚠️ ca-certificates 必须显式安装（2026-09-27 实测踩坑）：
+# 缺了它 /etc/ssl/certs/ 是空的，容器内【所有 HTTPS 请求都失败】：
+#   curl: error setting certificate file: /etc/ssl/certs/ca-certificates.crt
+# 症状极具迷惑性 —— DNS 正常、TCP 能连（Trying/Connected 都打印了），
+# 但 TLS 握手就断，npm/curl 全部 000，看起来像"容器没网"。
 RUN apt-get update && apt-get install -y --no-install-recommends \
         bash \
         curl \
@@ -37,6 +42,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         jq \
         python3 \
         build-essential \
+        ca-certificates \
+    && update-ca-certificates 2>/dev/null || true \
     && rm -rf /var/lib/apt/lists/* \
     && mkdir -p /data/dsh
 
