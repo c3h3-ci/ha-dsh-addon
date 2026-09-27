@@ -64,11 +64,17 @@ COPY custom_components/ /custom_components/
 # ── healthcheck 只验证"服务在监听"，不验证 HTTP 状态码 ──
 # 原因（2026-09-27 实测）：DSH 的 Web UI（3081）与桥接 API（3082）都要求认证，
 # 裸请求一律 401；wget 遇 401 退出码非 0，于是 healthcheck 永远失败
-# （FailingStreak 累积到 132），容器被标成 unhealthy —— 但服务其实完全正常
-# （带 token 请求 /api/status 返回 200，Web 与日志都有实时活动）。
-# 用 /dev/tcp 探测端口即可：连得上 = 进程活着 = healthy。
-HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
-    CMD sh -c '(echo > /dev/tcp/127.0.0.1/3081) 2>/dev/null && (echo > /dev/tcp/127.0.0.1/3082) 2>/dev/null || exit 1' 
+# （FailingStreak 累积到 132），容器被标成 unhealthy —— 但服务其实完全正常。
+#
+# ⚠️ 必须用 bash，不能用 sh：本镜像的 /bin/sh 是 dash，它【不支持 /dev/tcp】
+#    （报 "cannot create /dev/tcp/...: Directory nonexistent"），
+#    那样探针会永远失败 —— 这正是第一版修复踩到的坑。
+# 用 curl 探 TCP 端口最稳（镜像里已有 curl）：
+# 探 3080（HTTP proxy → Web UI）：curl 的连接成功即视为健康。
+# 用 \`|| exit 1\` 而非判断状态码：401/200/302 都说明服务在监听，
+# 只有【连不上】（000）才是真的挂了。
+HEALTHCHECK --interval=30s --timeout=10s --start-period=120s --retries=3 \
+    CMD curl -s -o /dev/null --connect-timeout 5 http://127.0.0.1:3080/ || exit 1
 
 WORKDIR /config
 CMD [ "/run.sh" ]
