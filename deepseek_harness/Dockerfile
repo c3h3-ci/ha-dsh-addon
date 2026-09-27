@@ -61,8 +61,14 @@ RUN chmod a+x /run.sh
 # 容器启动时 run.sh 会复制到 /config/custom_components/，实现 addon 自带集成
 COPY custom_components/ /custom_components/
 
+# ── healthcheck 只验证"服务在监听"，不验证 HTTP 状态码 ──
+# 原因（2026-09-27 实测）：DSH 的 Web UI（3081）与桥接 API（3082）都要求认证，
+# 裸请求一律 401；wget 遇 401 退出码非 0，于是 healthcheck 永远失败
+# （FailingStreak 累积到 132），容器被标成 unhealthy —— 但服务其实完全正常
+# （带 token 请求 /api/status 返回 200，Web 与日志都有实时活动）。
+# 用 /dev/tcp 探测端口即可：连得上 = 进程活着 = healthy。
 HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
-    CMD wget -qO- http://127.0.0.1:3081 >/dev/null 2>&1 && wget -qO- http://127.0.0.1:3082/api/status >/dev/null 2>&1 || exit 1
+    CMD sh -c '(echo > /dev/tcp/127.0.0.1/3081) 2>/dev/null && (echo > /dev/tcp/127.0.0.1/3082) 2>/dev/null || exit 1' 
 
 WORKDIR /config
 CMD [ "/run.sh" ]
