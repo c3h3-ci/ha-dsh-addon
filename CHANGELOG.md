@@ -2,6 +2,25 @@
 
 本 addon 的版本变更记录。格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)，版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.2.44] - 2026-09-27
+
+### 修复
+
+- **vendor 完整性检查漏查传递依赖（崩溃循环的真正根因）**：旧实现只遍历 `@deepseek-ai/dsh` 自己的顶层 `dependencies`（当时 81 个），传递依赖一个都不查。真实故障是 execa 的传递依赖 `is-plain-obj` 缺失，DSH 启动即 `ERR_MODULE_NOT_FOUND` → 进程退出 → Supervisor watchdog 反复拉起 → **崩溃循环**；而每次启动自检都打印 `vendor DSH integrity OK (deps: 81)`——体检报告一路绿灯、故障却真实存在，排查因此被误导很久。现改为递归扫描 `node_modules` 树下（含嵌套）**每一个**已安装包，逐个校验其声明的运行时依赖能否从该包自身位置解析；任何一层缺失即判损坏。`peerDependencies` / `optionalDependencies` 不计入（npm 不保证安装，计入会误报）。逻辑抽到 `vendor_check.js`，由 `run.sh` 与 `api_server.js` **共用同一实现**，避免两处漂移。实测对 HA 上真实的 523 个包树判定完整；移走一个被 127 个包依赖的包后，级联检出 126 条缺失。
+- **一键更新会被 watchdog 中途杀死（更新永远失败）**：`npm install` 在低功耗 ARM 上约 10 分钟，期间 CPU 吃满、3080 可能连续数分钟无响应，旧的 healthcheck 参数（`interval 30s × retries 3` ≈ 90s）会把容器判为 unhealthy → Supervisor 重启容器 → **npm install 被杀**，只留下半截 `vendor.tmp`，版本永远升不上去（用户侧表现为"点了更新，结果没变化甚至服务挂了"）。现采取三重措施：① 安装期间写 `/data/dsh/.installing` 标记，`healthcheck.sh` 据此**直接豁免**（标记同时设 30 分钟上限，避免失败残留永久关掉自愈）；② 健康探测容差放宽到 `interval 30s / timeout 15s / retries 6`（≈3 分钟连续失败才重启）；③ 安装进程以 `nice -n 19` 最低优先级运行，保住 UI 响应。
+- **半截安装会被当作"安装成功"换上（容器随即崩溃循环）**：旧实现只检查 `vendor.tmp` 里 `bin.js` 存在就做原子切换，而被中断的 npm install 恰恰会留下「`bin.js` 已落盘、传递依赖缺失」的半截目录，换上后下次启动即崩。现在**切换前必须通过完整依赖图校验**，不通过则放弃切换、抛错并保留旧版本，同时清掉几百 MB 的失败残留。
+
+### 变更
+
+- **更新通道统一为单一事实源**：此前三处不一致——`run.sh` 首装用 `latest`（第 85 行注释却写 `@next`）、`Dockerfile` 内置装 `@latest`、`api_server.js` 一键更新默认 `next`。后果是首次安装拿到 `latest`（当时停在 0.1.5-rc.3），而"检查更新"提示 `next` 已有 0.1.7-rc.2，两边对不上，"装完即最新"的承诺落空。现统一由 `DSH_CHANNEL`（默认 `next`，符合 DESIGN.md §9.5）决定，`run.sh` 与 `Dockerfile` 一致，可用环境变量/构建参数覆盖。
+- **vendor 损坏时先尝试回滚再回退内置版**：旧实现发现损坏直接 `rm -rf vendor`（丢掉唯一可用的回滚版本）。现在若 `vendor.old` 完整则先回滚，两者都不可用才回退镜像内置版。
+
+### 测试
+
+- 新增 `tests/test_vendor_check.js`（11 项断言）：覆盖真实故障形态（顶层依赖齐全、传递依赖缺失必须判损坏）、嵌套 `node_modules` 解析语义、`optional`/`peer` 不误报、无入口文件的包不算缺失、空/不存在目录不抛异常。
+- 新增 `tests/test_update_path.js`（15 项断言）：用可注入的假 npm（`DSH_TEST_INSTALL_SCRIPT`）驱动真实 `POST /api/update`，证明半截安装被拒绝且**旧 vendor 保持可用**、完整安装正常切换并留 `vendor.old` 备份、安装标记按时清除、`healthcheck.sh` 在安装期间豁免且陈旧标记后恢复自愈。
+- CI 增加 `vendor_check.js` / `run.sh` / `healthcheck.sh` 语法检查与上述两组测试。
+
 ## [0.2.43] - 2026-09-06
 
 ### 修复

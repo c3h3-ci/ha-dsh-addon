@@ -21,10 +21,16 @@ jobs:
         with:
           node-version: 22
 
-      - name: Node.js syntax check (proxy.js, api_server.js)
+      - name: Node.js syntax check (proxy.js, api_server.js, vendor_check.js)
         run: |
           node --check deepseek_harness/proxy.js
           node --check deepseek_harness/api_server.js
+          node --check deepseek_harness/vendor_check.js
+
+      - name: Shell syntax check (run.sh, healthcheck.sh)
+        run: |
+          bash -n deepseek_harness/run.sh
+          bash -n deepseek_harness/healthcheck.sh
 
       - name: Python syntax check (custom_component)
         run: |
@@ -57,6 +63,16 @@ jobs:
 
       - name: Run bridge API contract tests
         run: node tests/test_bridge_api.js
+
+      # vendor 完整性校验的单元测试：覆盖"顶层依赖齐全、传递依赖缺失"这一
+      # 真实故障形态（旧实现会误报 OK，导致容器崩溃循环）。
+      - name: Run vendor integrity checker tests
+        run: node tests/test_vendor_check.js
+
+      # 一键更新路径测试：证明半截安装被拒绝切换、旧版本保持可用、
+      # 安装期间 healthcheck 豁免（避免 watchdog 杀掉 npm install）。
+      - name: Run update path tests
+        run: node tests/test_update_path.js
 
   build:
     name: Docker Build Check

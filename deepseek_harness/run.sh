@@ -88,30 +88,33 @@ VENDOR_TMP="/data/dsh/vendor.tmp"
 VENDOR_DSH_BIN="${VENDOR_DIR}/node_modules/@deepseek-ai/dsh/lib/bin.js"
 NPM_REGISTRY="${DSH_NPM_REGISTRY:-https://registry.npmmirror.com}"
 
-# 验证 vendor DSH 完整性：package.json 可解析 + 全部运行时依赖可解析。
-# 曾出现 vendor 装包不全导致 "Cannot find package '@deepseek-ai/cordis-plugin-group'"
-# DSH 启动失败并进入 stopped 状态，因此损坏时必须自动回退内置版（DESIGN.md §9.6 风险表）。
+# 统一更新通道（单一事实源）。DESIGN.md §9.5 规定「一键更新」默认指向 next（预发布，
+# 含最新 rc），可用环境变量 DSH_CHANNEL 覆盖。
+# ⚠️ 修订（2026-09-27）：此前三处不一致 —— 本文件首装写 "latest"（第 85 行注释却写 @next）、
+# Dockerfile 内置装 "@latest"、api_server.js 一键更新默认 "next"。后果：用户首次安装
+# 拿到 latest（当时 0.1.5-rc.3），而「检查更新」提示 next 有 0.1.7-rc.2，两边对不上，
+# 且首装"装完即最新"的承诺落空。现统一走本常量。
+DSH_CHANNEL="${DSH_CHANNEL:-next}"
+
+# 验证 vendor DSH 完整性：package.json 可解析 + **依赖图（含传递依赖）** 可解析。
+#
+# ⚠️ 历史教训（2026-09-27 实测踩坑）：旧实现只遍历 `@deepseek-ai/dsh` 自己的
+# 顶层 dependencies（当时 81 个），传递依赖一个都不查。真实故障是 execa 的传递依赖
+# `is-plain-obj` 缺失 → DSH 启动即 ERR_MODULE_NOT_FOUND → 进程退出 → HA watchdog
+# 反复拉起 → 崩溃循环；而每次启动自检都打印 "vendor DSH integrity OK (deps: 81)"，
+# **体检报告一路绿灯，故障却真实存在**。排查因此被误导了很久。
+#
+# 现改为：扫描 node_modules 树下（含嵌套）每一个已安装包，逐个校验其声明的运行时
+# 依赖能否从该包自身位置解析 —— 任何一层缺失都判定为损坏，自动回退镜像内置版。
+# peer/optional 依赖不计入（npm 不保证安装，计为缺失会误报）。
+#
+# 实现抽到 vendor_check.js，与 api_server.js 共用同一份逻辑，
+# 避免"桥接说 OK、run.sh 说坏"这类两处实现漂移。
+VENDOR_CHECK_JS="/vendor_check.js"
+
 vendor_integrity_ok() {
-    node -e "
-        const fs = require('fs');
-        const path = require('path');
-        const base = '${VENDOR_DIR}/node_modules';
-        const pkgPath = path.join(base, '@deepseek-ai/dsh/package.json');
-        try {
-          const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
-          const deps = Object.keys(pkg.dependencies || {}).filter(
-            d => !(pkg.optionalDependencies || {})[d]
-          );
-          for (const d of deps) {
-            try { require.resolve(d, { paths: [base, path.dirname(pkgPath)] }); }
-            catch (e) { console.error('missing dep: ' + d); process.exit(1); }
-          }
-          console.log('vendor DSH integrity OK (deps: ' + deps.length + ')');
-        } catch (e) {
-          console.error('vendor DSH invalid: ' + e.message);
-          process.exit(1);
-        }
-    "
+    local target="${1:-${VENDOR_DIR}}"
+    node "${VENDOR_CHECK_JS}" "${target}"
 }
 
 # 原子安装 DSH 到 vendor：npm install 到 tmp → 切换 → 写更新标记。
@@ -125,7 +128,11 @@ install_dsh_vendor() {
             --prefix "${VENDOR_TMP}" \
             --registry "${NPM_REGISTRY}" \
             --no-audit --no-fund >/dev/null 2>&1 \
-       && [ -f "${VENDOR_TMP}/node_modules/@deepseek-ai/dsh/lib/bin.js" ]; then
+       && [ -f "${VENDOR_TMP}/node_modules/@deepseek-ai/dsh/lib/bin.js" ] \
+       && vendor_integrity_ok "${VENDOR_TMP}"; then
+        # ⚠️ 必须「先校验、后切换」：旧实现只检查 bin.js 存在就切换，于是
+        # npm 被中断留下的半截 vendor.tmp（bin.js 已落盘、传递依赖缺失）
+        # 会被当成"安装成功"换上，容器随即崩溃循环。完整性检查现在前移到这里。
         rm -rf "${VENDOR_DIR}.old"
         [ -d "${VENDOR_DIR}" ] && mv "${VENDOR_DIR}" "${VENDOR_DIR}.old"
         mv "${VENDOR_TMP}" "${VENDOR_DIR}"
@@ -135,6 +142,7 @@ install_dsh_vendor() {
         echo "[DSH Addon] Installed DSH @${channel} to vendor: ${ver}"
         return 0
     fi
+    echo "[DSH Addon] install failed or integrity check failed for @${channel}; keeping existing vendor"
     rm -rf "${VENDOR_TMP}"
     return 1
 }
@@ -148,16 +156,27 @@ if [ -f "${VENDOR_DSH_BIN}" ]; then
             echo "[DSH Addon] Update marker: $(cat "${VENDOR_DIR}/.updated")"
         fi
     else
-        echo "[DSH Addon] ERROR: vendor DSH corrupted (missing deps) - removing and falling back to built-in"
-        rm -rf "${VENDOR_DIR}"
-        DSH_BIN="/usr/local/lib/node_modules/@deepseek-ai/dsh/lib/bin.js"
-        echo "[DSH Addon] Using built-in DSH: ${DSH_BIN}"
+        # 损坏时不要直接删掉 —— 它可能是唯一的可回滚版本，且磁盘上还留着
+        # vendor.old。先尝试用 .old 回滚（若其完整），两个都不行才回退内置版。
+        if [ -d "${VENDOR_DIR}.old" ] && vendor_integrity_ok "${VENDOR_DIR}.old"; then
+            echo "[DSH Addon] WARN: vendor corrupted; rolling back to vendor.old"
+            rm -rf "${VENDOR_DIR}"
+            mv "${VENDOR_DIR}.old" "${VENDOR_DIR}"
+            DSH_BIN="${VENDOR_DSH_BIN}"
+            echo "[DSH Addon] Rolled back to previous vendor DSH: ${DSH_BIN}"
+        else
+            echo "[DSH Addon] ERROR: vendor DSH corrupted (missing deps) - removing and falling back to built-in"
+            rm -rf "${VENDOR_DIR}"
+            DSH_BIN="/usr/local/lib/node_modules/@deepseek-ai/dsh/lib/bin.js"
+            echo "[DSH Addon] Using built-in DSH: ${DSH_BIN}"
+        fi
     fi
 else
-    # 首次启动：自动安装 @latest（稳定通道）到持久化 vendor，让新客户装完即用稳定版。
-    # 失败不阻断启动，静默回退镜像内置版（离线兜底），下次启动自动重试。
-    echo "[DSH Addon] First start: auto-installing DSH @latest to vendor..."
-    if install_dsh_vendor "latest" && vendor_integrity_ok; then
+    # 首次启动：自动安装 DSH_CHANNEL（默认 next，见上方单一事实源）到持久化 vendor，
+    # 让新客户装完即用带最新 rc 的版本。失败不阻断启动，静默回退镜像内置版
+    # （离线兜底），下次启动自动重试。
+    echo "[DSH Addon] First start: auto-installing DSH @${DSH_CHANNEL} to vendor..."
+    if install_dsh_vendor "${DSH_CHANNEL}"; then
         DSH_BIN="${VENDOR_DSH_BIN}"
         echo "[DSH Addon] Using auto-installed DSH: ${DSH_BIN}"
     else
